@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 #
-# Tested on Debian 12
 # install-freeswitch.sh
 # Builds and installs FreeSWITCH from source on Debian/Ubuntu.
 # Tested on Ubuntu 22.04 / 24.04 and Debian 12.

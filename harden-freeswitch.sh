@@ -1,18 +1,24 @@
 #!/usr/bin/env bash
 #
-# Tested on Debian 12
 # harden-freeswitch.sh
 # Post-install hardening for a default FreeSWITCH on Debian/Ubuntu.
 #
 # What it does:
-#   1. Backs up /etc/freeswitch (or source-install equivalent)
+#   1. Backs up the FreeSWITCH config dir
 #   2. Replaces the default SIP password (vars.xml: default_password=1234)
 #   3. Replaces the Event Socket password (ClueCon) and binds it to loopback
-#   4. Writes generated credentials to /root/freeswitch-credentials.txt (mode 600)
-#   5. Installs and configures fail2ban with a freeswitch jail
-#   6. Configures ufw: default deny, allow SSH, SIP, RTP (optional source IP allowlist)
-#   7. Reloads FreeSWITCH config
-#   8. Writes /etc/fs_cli.conf (and ~SUDO_USER/.fs_cli_conf) so `fs_cli` keeps working
+#   4. Enables log-auth-failures on both SIP profiles so failed registrations
+#      actually reach the log (default is OFF — this is why fail2ban setups
+#      for FreeSWITCH silently fail to catch anything out of the box)
+#   5. Writes generated credentials to /root/freeswitch-credentials.txt
+#   6. Installs and configures fail2ban with a working FreeSWITCH 1.10.x filter,
+#      plus rsyslog + python3-systemd so the sshd jail works on minimal Debian
+#   7. Configures ufw: default deny, allow SSH + RTP, allow SIP
+#      (optionally restricted to specific source IPs)
+#   8. Reloads FreeSWITCH using the PREVIOUS ESL password so the reload itself
+#      actually authenticates; rescans sofia profiles to apply #4
+#   9. Writes /etc/fs_cli.conf and ~SUDO_USER/.fs_cli_conf with the new ESL
+#      password so `fs_cli` keeps working after the rotation
 #
 # What it does NOT do (leaves to you):
 #   - Disable individual modules (too risky to guess what you use)
@@ -112,6 +118,24 @@ if ! grep -q "value=\"${NEW_ESL_PW}\"" "$ESL_XML"; then
   exit 1
 fi
 
+# --- 4b. enable log-auth-failures on SIP profiles ----------------------------
+# Without this, FreeSWITCH silently swallows SIP auth failure events — they
+# never hit the log, and fail2ban's freeswitch jail has nothing to catch.
+# This is the well-known reason fail2ban+FreeSWITCH setups "don't work" out
+# of the box. Flip it to true on both the internal (5060) and external (5080)
+# profiles.
+echo ">>> Enabling log-auth-failures on SIP profiles"
+for profile in "${FS_CONF}/sip_profiles/internal.xml" \
+               "${FS_CONF}/sip_profiles/external.xml"; do
+  [[ -f "$profile" ]] || continue
+  if grep -q 'name="log-auth-failures"' "$profile"; then
+    sed -i 's|<param name="log-auth-failures" value="false"/>|<param name="log-auth-failures" value="true"/>|' "$profile"
+  else
+    # Parameter is missing entirely; inject it before </settings>
+    sed -i '/<\/settings>/i\    <param name="log-auth-failures" value="true"/>' "$profile"
+  fi
+done
+
 # --- 5. save credentials -----------------------------------------------------
 umask 077
 cat > "$CREDS_FILE" <<EOF
@@ -161,20 +185,19 @@ if [[ "$SKIP_FAIL2BAN" != "1" ]]; then
     fi
   fi
 
-  # The fail2ban package ships /etc/fail2ban/filter.d/freeswitch.conf already.
-  # If missing, drop a minimal one.
-  if [[ ! -f /etc/fail2ban/filter.d/freeswitch.conf ]]; then
-    cat >/etc/fail2ban/filter.d/freeswitch.conf <<'EOF'
-[INCLUDES]
-before = common.conf
-
+  # The fail2ban package ships /etc/fail2ban/filter.d/freeswitch.conf but its
+  # regex doesn't match FreeSWITCH 1.10.x output (which includes a CPU-usage
+  # percentage between the timestamp and [WARNING]). Overwrite it directly
+  # rather than using a .local with `before =`, which causes a recursive
+  # include loop that crashes fail2ban with "maximum recursion depth exceeded".
+  cat >/etc/fail2ban/filter.d/freeswitch.conf <<'EOF'
 [Definition]
-failregex = ^.*\[WARNING\] sofia_reg\.c:.*SIP auth (failure|challenge) \((REGISTER|INVITE)\) on sofia profile \S+ for \[.*\] from ip <HOST>$
-            ^.*\[WARNING\] sofia_reg\.c:.*Can't find user \[.*@.*\] from <HOST>$
-            ^.*\[WARNING\] sofia\.c:.*Hacking attempt detected from <HOST>.*$
+failregex = ^.*\[WARNING\]\s+sofia_reg\.c:\d+\s+SIP auth failure \((?:REGISTER|INVITE)\) on sofia profile \S+ for \[[^\]]*\] from ip <HOST>\s*$
+            ^.*\[WARNING\]\s+sofia_reg\.c:\d+\s+Can't find user \[[^\]]*\] from <HOST>\s*$
 ignoreregex =
 EOF
-  fi
+  # Remove any stale .local override from previous buggy runs
+  rm -f /etc/fail2ban/filter.d/freeswitch.local
 
   cat >/etc/fail2ban/jail.d/freeswitch.local <<EOF
 [freeswitch]
@@ -248,6 +271,10 @@ fi
 if [[ -n "$FS_CLI" ]] && systemctl is-active --quiet freeswitch; then
   echo ">>> Reloading FreeSWITCH with previous ESL password"
   "$FS_CLI" -p "$CURRENT_ESL_PW" -x 'reloadxml' || true
+  # Rescan SIP profiles so the log-auth-failures change takes effect without
+  # a full service restart.
+  "$FS_CLI" -p "$CURRENT_ESL_PW" -x 'sofia profile internal rescan' || true
+  "$FS_CLI" -p "$CURRENT_ESL_PW" -x 'sofia profile external rescan' || true
   # This one drops the connection mid-command (expected) and brings the
   # listener back up bound to 127.0.0.1 with the new password.
   "$FS_CLI" -p "$CURRENT_ESL_PW" -x 'reload mod_event_socket' || true
