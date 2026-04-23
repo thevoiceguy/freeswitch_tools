@@ -2,7 +2,7 @@
 #
 # install-freeswitch.sh
 # Builds and installs FreeSWITCH from source on Debian/Ubuntu.
-# Tested on Ubuntu 22.04 / 24.04 and Debian 12.
+# Tested on Debian 12. Should work on Ubuntu 22.04 / 24.04
 #
 # Usage:  sudo ./install-freeswitch.sh [version]
 # Example: sudo ./install-freeswitch.sh v1.10.12
