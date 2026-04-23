@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 #
-# Tested on Debian 12
 # harden-freeswitch.sh
 # Post-install hardening for a default FreeSWITCH on Debian/Ubuntu.
 #
@@ -132,16 +131,33 @@ if [[ "$SKIP_FAIL2BAN" != "1" ]]; then
   echo ">>> Installing and configuring fail2ban"
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
-  apt-get install -y --no-install-recommends fail2ban
+  # rsyslog is pulled in because fail2ban's default sshd jail reads
+  # /var/log/auth.log — minimal Debian cloud images often omit rsyslog and
+  # route auth only to journald, which makes fail2ban fail to start.
+  # python3-systemd lets fail2ban read directly from journald as a fallback
+  # (used by the sshd.local override below).
+  apt-get install -y --no-install-recommends fail2ban rsyslog python3-systemd
 
-  # Locate the freeswitch log
-  if [[ -f /var/log/freeswitch/freeswitch.log ]]; then
+  # Determine FreeSWITCH log path based on the install type we detected
+  # earlier (FS_CONF). Package install logs to /var/log/freeswitch,
+  # source install uses prefix-relative FHS: <prefix>/var/log/freeswitch.
+  if [[ "$FS_CONF" == "/etc/freeswitch" ]]; then
     FS_LOG="/var/log/freeswitch/freeswitch.log"
-  elif [[ -f /usr/local/freeswitch/log/freeswitch.log ]]; then
-    FS_LOG="/usr/local/freeswitch/log/freeswitch.log"
   else
-    FS_LOG="/var/log/freeswitch/freeswitch.log"
-    echo "!!! freeswitch.log not found yet; jail will use ${FS_LOG} once it exists." >&2
+    # FS_CONF is <prefix>/etc/freeswitch — strip two levels to get <prefix>
+    FS_PREFIX="$(dirname "$(dirname "$FS_CONF")")"
+    FS_LOG="${FS_PREFIX}/var/log/freeswitch/freeswitch.log"
+  fi
+
+  # fail2ban refuses to start if the logpath doesn't exist yet. If FreeSWITCH
+  # hasn't created it, touch it into existence with the right ownership.
+  if [[ ! -f "$FS_LOG" ]]; then
+    echo ">>> $FS_LOG doesn't exist yet; creating it so fail2ban can start"
+    mkdir -p "$(dirname "$FS_LOG")"
+    touch "$FS_LOG"
+    if id -u freeswitch >/dev/null 2>&1; then
+      chown freeswitch:freeswitch "$FS_LOG" "$(dirname "$FS_LOG")" 2>/dev/null || true
+    fi
   fi
 
   # The fail2ban package ships /etc/fail2ban/filter.d/freeswitch.conf already.
@@ -169,6 +185,15 @@ logpath  = ${FS_LOG}
 maxretry = 5
 findtime = 600
 bantime  = 3600
+EOF
+
+  # Default sshd jail on minimal Debian reads /var/log/auth.log which doesn't
+  # exist without rsyslog. We install rsyslog above, but just in case (and to
+  # be robust on systems where rsyslog is delayed), also pin the sshd jail
+  # to the systemd backend, which reads auth events directly from journald.
+  cat >/etc/fail2ban/jail.d/sshd.local <<EOF
+[sshd]
+backend = systemd
 EOF
 
   systemctl enable --now fail2ban
