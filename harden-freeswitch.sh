@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 #
+# Tested on Debian 12
 # harden-freeswitch.sh
 # Post-install hardening for a default FreeSWITCH on Debian/Ubuntu.
 #
