@@ -15,7 +15,7 @@
 #   8. Writes /etc/fs_cli.conf (and ~SUDO_USER/.fs_cli_conf) so `fs_cli` keeps working
 #
 # What it does NOT do (leaves to you):
-#   - Disable individual modules (only you know what you use)
+#   - Disable individual modules (too risky to guess what you use)
 #   - Set up SIP-TLS / SRTP (needs a domain + cert)
 #   - Restrict the dialplan / configure outbound gateways
 #   - Set per-extension passwords (only changes the shared default)
