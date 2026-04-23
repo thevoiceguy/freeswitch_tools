@@ -114,7 +114,7 @@ sudo CODENAME=bookworm TOKEN=pat_xxx ./install-freeswitch-token.sh
 
 ## `harden-freeswitch.sh` — post-install hardening
 
-Run this **once** after either installer, before exposing the box to the internet. The defaults that ship with FreeSWITCH (passwords `1234` and `ClueCon`) get exploited within hours of going online.
+Run this **once** after either installer, before exposing the box to the internet. The defaults that ship with FreeSWITCH (passwords `1234` and `ClueCon`) get exploited within minutes of going online.
 
 ### Usage
 
