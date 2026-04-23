@@ -15,8 +15,8 @@ Pick **one** installer, then run the hardening script.
 ## Requirements
 
 - Debian 12 (Bookworm) — fully supported by both installers
-- Debian 13 (Trixie) — only `install-freeswitch.sh` (from source); SignalWire's package repo for trixie is not yet populated
-- Ubuntu 22.04 / 24.04 — `install-freeswitch.sh` works; the token installer is best-effort (set `CODENAME=bookworm`)
+- Debian 13 (Trixie) — not tested; only `install-freeswitch.sh` (from source); SignalWire's package repo for trixie is not yet populated
+- Ubuntu 22.04 / 24.04 — not tested ; `install-freeswitch.sh` works; the token installer is best-effort (set `CODENAME=bookworm`)
 - Root access (run with `sudo`)
 - A clean box. None of these scripts are designed to coexist with an existing FreeSWITCH install.
 
