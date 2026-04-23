@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 #
+# Tested on Debian 12
 # install-freeswitch-token.sh
 # Installs FreeSWITCH on Debian using SignalWire's prebuilt packages.
 # Requires a free SignalWire Personal Access Token (PAT):
