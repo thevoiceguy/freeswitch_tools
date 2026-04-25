@@ -11,14 +11,15 @@
 #      actually reach the log (default is OFF — this is why fail2ban setups
 #      for FreeSWITCH silently fail to catch anything out of the box)
 #   5. Writes generated credentials to /root/freeswitch-credentials.txt
-#   6. Installs and configures fail2ban with:
-#        - A working FreeSWITCH 1.10.x filter (default doesn't match because
-#          1.10.x logs include a CPU-usage % between timestamp and [WARNING])
-#        - Tighter thresholds than the defaults (3 failures in 10 min -> 24h
-#          ban) because SIP scanners burn through default thresholds easily
-#        - A recidive jail that escalates repeat offenders to a 1-week
-#          all-port ban (most bad actors come back the moment their first
-#          ban expires; recidive watches fail2ban's own log to catch them)
+#   6. Installs and configures fail2ban with a THREE-LAYER defense:
+#        - Strict 'freeswitch' jail (3 auth failures in 10 min -> 24h ban)
+#          catches old-school credential brute-force attacks
+#        - Loose 'freeswitch-aggressive' jail (20 events in 5 min -> 24h ban)
+#          catches the modern attack pattern: unauthenticated INVITE floods
+#          that never even attempt to authenticate, so they never generate
+#          'SIP auth failure' lines and slip past the strict jail entirely
+#        - 'recidive' jail (3 cross-jail bans in 24h -> 7d all-port ban)
+#          escalates IPs that get banned repeatedly by either of the above
 #        - rsyslog + python3-systemd so the sshd jail works on minimal Debian
 #   7. Configures ufw: default deny, allow SSH + RTP, allow SIP
 #      (optionally restricted to specific source IPs)
@@ -27,7 +28,7 @@
 #   9. Writes /etc/fs_cli.conf and ~SUDO_USER/.fs_cli_conf with the new ESL
 #      password so `fs_cli` keeps working after the rotation
 #  10. Runs fail2ban-regex against the live FreeSWITCH log to print a
-#      one-line summary of whether the filter is actually matching anything.
+#      one-line summary of whether each filter is actually matching anything.
 #      If you see "matched: 0" here, something is wrong — fix it before
 #      walking away.
 #
@@ -96,8 +97,6 @@ NEW_ESL_PW="$(gen_pw)"
 
 # --- 3. patch vars.xml (default_password) ------------------------------------
 echo ">>> Updating default SIP password in vars.xml"
-# Match: <X-PRE-PROCESS cmd="set" data="default_password=anything"/>
-# Replace the value only. Use | as sed delimiter to avoid clashing with /.
 sed -i.bak -E \
   "s|(default_password=)[^\"]*|\1${NEW_SIP_PW}|g" \
   "$VARS_XML"
@@ -108,18 +107,13 @@ if ! grep -q "default_password=${NEW_SIP_PW}" "$VARS_XML"; then
 fi
 
 # --- 4. patch event_socket.conf.xml ------------------------------------------
-# Capture the CURRENT ESL password before changing it, so we can authenticate
-# the reload command below. Falls back to "ClueCon" (the FreeSWITCH default)
-# if the file doesn't have a recognizable password line.
 CURRENT_ESL_PW="$(grep -oP '<param\s+name="password"\s+value="\K[^"]+' "$ESL_XML" | head -n1 || true)"
 CURRENT_ESL_PW="${CURRENT_ESL_PW:-ClueCon}"
 
 echo ">>> Updating Event Socket password and binding to loopback"
-# password
 sed -i.bak -E \
   "s|(<param name=\"password\" value=\")[^\"]*(\"/>)|\1${NEW_ESL_PW}\2|" \
   "$ESL_XML"
-# listen-ip -> 127.0.0.1
 sed -i -E \
   "s|(<param name=\"listen-ip\" value=\")[^\"]*(\"/>)|\1127.0.0.1\2|" \
   "$ESL_XML"
@@ -130,11 +124,6 @@ if ! grep -q "value=\"${NEW_ESL_PW}\"" "$ESL_XML"; then
 fi
 
 # --- 4b. enable log-auth-failures on SIP profiles ----------------------------
-# Without this, FreeSWITCH silently swallows SIP auth failure events — they
-# never hit the log, and fail2ban's freeswitch jail has nothing to catch.
-# This is the well-known reason fail2ban+FreeSWITCH setups "don't work" out
-# of the box. Flip it to true on both the internal (5060) and external (5080)
-# profiles.
 echo ">>> Enabling log-auth-failures on SIP profiles"
 for profile in "${FS_CONF}/sip_profiles/internal.xml" \
                "${FS_CONF}/sip_profiles/external.xml"; do
@@ -142,7 +131,6 @@ for profile in "${FS_CONF}/sip_profiles/internal.xml" \
   if grep -q 'name="log-auth-failures"' "$profile"; then
     sed -i 's|<param name="log-auth-failures" value="false"/>|<param name="log-auth-failures" value="true"/>|' "$profile"
   else
-    # Parameter is missing entirely; inject it before </settings>
     sed -i '/<\/settings>/i\    <param name="log-auth-failures" value="true"/>' "$profile"
   fi
 done
@@ -167,26 +155,15 @@ if [[ "$SKIP_FAIL2BAN" != "1" ]]; then
   echo ">>> Installing and configuring fail2ban"
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
-  # rsyslog is pulled in because fail2ban's default sshd jail reads
-  # /var/log/auth.log — minimal Debian cloud images often omit rsyslog and
-  # route auth only to journald, which makes fail2ban fail to start.
-  # python3-systemd lets fail2ban read directly from journald as a fallback
-  # (used by the sshd.local override below).
   apt-get install -y --no-install-recommends fail2ban rsyslog python3-systemd
 
-  # Determine FreeSWITCH log path based on the install type we detected
-  # earlier (FS_CONF). Package install logs to /var/log/freeswitch,
-  # source install uses prefix-relative FHS: <prefix>/var/log/freeswitch.
   if [[ "$FS_CONF" == "/etc/freeswitch" ]]; then
     FS_LOG="/var/log/freeswitch/freeswitch.log"
   else
-    # FS_CONF is <prefix>/etc/freeswitch — strip two levels to get <prefix>
     FS_PREFIX="$(dirname "$(dirname "$FS_CONF")")"
     FS_LOG="${FS_PREFIX}/var/log/freeswitch/freeswitch.log"
   fi
 
-  # fail2ban refuses to start if the logpath doesn't exist yet. If FreeSWITCH
-  # hasn't created it, touch it into existence with the right ownership.
   if [[ ! -f "$FS_LOG" ]]; then
     echo ">>> $FS_LOG doesn't exist yet; creating it so fail2ban can start"
     mkdir -p "$(dirname "$FS_LOG")"
@@ -196,30 +173,49 @@ if [[ "$SKIP_FAIL2BAN" != "1" ]]; then
     fi
   fi
 
+  # ---- STRICT FILTER ------------------------------------------------------
   # The fail2ban package ships /etc/fail2ban/filter.d/freeswitch.conf but its
   # regex doesn't match FreeSWITCH 1.10.x output (which includes a CPU-usage
   # percentage between the timestamp and [WARNING]). Overwrite it directly
   # rather than using a .local with `before =`, which causes a recursive
   # include loop that crashes fail2ban with "maximum recursion depth exceeded".
   #
-  # We deliberately match `SIP auth failure` and `Can't find user` only.
-  # We do NOT match `SIP auth challenge` because every legitimate SIP
-  # request starts with a challenge — banning on challenge would ban every
-  # real user the moment they registered.
+  # This filter matches `SIP auth failure` and `Can't find user` ONLY.
+  # It does NOT match `SIP auth challenge` because every legitimate SIP
+  # transaction begins with a server-issued challenge — banning on a single
+  # challenge would ban every real user the moment they registered.
   cat >/etc/fail2ban/filter.d/freeswitch.conf <<'EOF'
 [Definition]
 failregex = ^.*\[WARNING\]\s+sofia_reg\.c:\d+\s+SIP auth failure \((?:REGISTER|INVITE)\) on sofia profile \S+ for \[[^\]]*\] from ip <HOST>\s*$
             ^.*\[WARNING\]\s+sofia_reg\.c:\d+\s+Can't find user \[[^\]]*\] from <HOST>\s*$
 ignoreregex =
 EOF
-  # Remove any stale .local override from previous buggy runs
   rm -f /etc/fail2ban/filter.d/freeswitch.local
 
-  # Tighter thresholds than fail2ban defaults. Real users almost never hit
-  # 3 SIP auth failures in 10 minutes; SIP scanners hit hundreds. The 24h
-  # bantime means a scanner has to burn a fresh IP per test — the only
-  # downside is that a legitimate user who triple-fumbles their password
-  # gets locked out for 24h until you `fail2ban-client unban <ip>` them.
+  # ---- AGGRESSIVE FILTER --------------------------------------------------
+  # The strict filter above catches credential brute-force, but misses a far
+  # more common attack pattern: a scanner blasting unauthenticated INVITEs
+  # at the box, getting challenged, never responding, and immediately firing
+  # the next probe from a different source port. That pattern generates only
+  # 'SIP auth challenge' lines — never 'failure' — so the strict filter sees
+  # nothing.
+  #
+  # This filter ALSO matches 'challenge' events. By itself that would ban
+  # legitimate users on first call. Paired with maxretry=20 in the jail
+  # below, it doesn't — a real softphone generates only 1-3 challenges per
+  # registration cycle. A scanner generates 20 in seconds.
+  cat >/etc/fail2ban/filter.d/freeswitch-aggressive.conf <<'EOF'
+[Definition]
+failregex = ^.*\[WARNING\]\s+sofia_reg\.c:\d+\s+SIP auth (?:failure|challenge) \((?:REGISTER|INVITE)\) on sofia profile \S+ for \[[^\]]*\] from ip <HOST>\s*$
+            ^.*\[WARNING\]\s+sofia_reg\.c:\d+\s+Can't find user \[[^\]]*\] from <HOST>\s*$
+ignoreregex =
+EOF
+
+  # ---- STRICT JAIL --------------------------------------------------------
+  # Tighter thresholds than fail2ban defaults. Three real auth failures in
+  # 10 minutes earns a 24h ban. Real users almost never trigger this; the
+  # only false-positive scenario is someone fumbling a password 3+ times,
+  # which is recoverable with `fail2ban-client unban <ip>`.
   cat >/etc/fail2ban/jail.d/freeswitch.local <<EOF
 [freeswitch]
 enabled  = true
@@ -232,16 +228,39 @@ findtime = 600
 bantime  = 86400
 EOF
 
+  # ---- AGGRESSIVE JAIL ----------------------------------------------------
+  # Catches unauthenticated INVITE floods. 20 events in 5 minutes is well
+  # below typical scanner volume (often 5+ per second from a single IP) and
+  # well above what any real softphone would generate during normal use.
+  #
+  # If your environment has unusually chatty SIP clients (PBXs that
+  # re-register aggressively, monitoring systems that probe SIP, etc.),
+  # raise maxretry to 40 or 50. Watch the jail's match count for a few hours
+  # after install — if your own IPs show up, the threshold is too low.
+  cat >/etc/fail2ban/jail.d/freeswitch-aggressive.local <<EOF
+[freeswitch-aggressive]
+enabled  = true
+filter   = freeswitch-aggressive
+port     = 5060,5061,5080,5081
+protocol = all
+logpath  = ${FS_LOG}
+maxretry = 20
+findtime = 300
+bantime  = 86400
+EOF
+
+  # ---- RECIDIVE JAIL ------------------------------------------------------
   # The recidive jail watches fail2ban's own log. If an IP gets banned 3
-  # times within 24 hours (across ANY jail — sshd, freeswitch, etc.) it
-  # gets banned for a week across all ports via banaction_allports.
+  # times within 24 hours (across ANY jail — sshd, freeswitch, the
+  # aggressive jail, etc.) it gets banned for a week across all ports
+  # via banaction_allports.
   #
-  # This is what catches the persistent SIP scanners that wait out a 24h
-  # bantime and immediately come back. Without recidive, the same handful
-  # of IPs cycle ban -> wait -> ban -> wait indefinitely. With it, a few
-  # cycles is all they get before they're locked out for a week.
+  # This catches the persistent scanners that wait out a 24h bantime and
+  # immediately come back. Without recidive, the same handful of IPs cycle
+  # ban -> wait -> ban -> wait indefinitely. With it, a few cycles is all
+  # they get before they're locked out for a week across every port.
   #
-  # No false-positive risk: recidive only escalates IPs that fail2ban
+  # No false-positive risk: recidive only escalates IPs that fail2ban has
   # ALREADY banned multiple times.
   cat >/etc/fail2ban/jail.d/recidive.local <<EOF
 [recidive]
@@ -253,10 +272,10 @@ findtime  = 86400
 maxretry  = 3
 EOF
 
+  # ---- SSHD ---------------------------------------------------------------
   # Default sshd jail on minimal Debian reads /var/log/auth.log which doesn't
-  # exist without rsyslog. We install rsyslog above, but just in case (and to
-  # be robust on systems where rsyslog is delayed), also pin the sshd jail
-  # to the systemd backend, which reads auth events directly from journald.
+  # exist without rsyslog. Pin it to the systemd backend, which reads auth
+  # events directly from journald and works regardless of rsyslog state.
   cat >/etc/fail2ban/jail.d/sshd.local <<EOF
 [sshd]
 backend = systemd
@@ -271,19 +290,17 @@ if [[ "$SKIP_FIREWALL" != "1" ]]; then
   echo ">>> Configuring ufw"
   apt-get install -y --no-install-recommends ufw
 
-  # Make sure SSH stays open BEFORE enabling, or you'll lock yourself out.
   ufw --force reset >/dev/null
   ufw default deny incoming
   ufw default allow outgoing
   ufw allow OpenSSH
 
-  # RTP media range (always open; calls won't work otherwise)
   ufw allow 16384:32768/udp comment 'FreeSWITCH RTP'
 
   if [[ -n "$SIP_ALLOW_FROM" ]]; then
     IFS=',' read -ra ALLOWS <<< "$SIP_ALLOW_FROM"
     for src in "${ALLOWS[@]}"; do
-      src="$(echo "$src" | xargs)"   # trim
+      src="$(echo "$src" | xargs)"
       [[ -z "$src" ]] && continue
       ufw allow from "$src" to any port 5060 proto udp comment 'SIP internal'
       ufw allow from "$src" to any port 5060 proto tcp comment 'SIP internal'
@@ -306,27 +323,16 @@ if [[ "$SKIP_FIREWALL" != "1" ]]; then
 fi
 
 # --- 8. reload freeswitch ----------------------------------------------------
-# IMPORTANT ORDERING: the running FreeSWITCH process still has the OLD ESL
-# password in memory. We must authenticate the reload commands with the OLD
-# password. Reloading mod_event_socket then re-reads the config file and
-# activates the NEW password. Only AFTER that do we rewrite fs_cli.conf.
 if [[ -n "$FS_CLI" ]] && systemctl is-active --quiet freeswitch; then
   echo ">>> Reloading FreeSWITCH with previous ESL password"
   "$FS_CLI" -p "$CURRENT_ESL_PW" -x 'reloadxml' || true
-  # Rescan SIP profiles so the log-auth-failures change takes effect without
-  # a full service restart.
   "$FS_CLI" -p "$CURRENT_ESL_PW" -x 'sofia profile internal rescan' || true
   "$FS_CLI" -p "$CURRENT_ESL_PW" -x 'sofia profile external rescan' || true
-  # This one drops the connection mid-command (expected) and brings the
-  # listener back up bound to 127.0.0.1 with the new password.
   "$FS_CLI" -p "$CURRENT_ESL_PW" -x 'reload mod_event_socket' || true
   sleep 1
 fi
 
-# --- 9. fs_cli.conf so future `fs_cli` invocations just work -----------------
-# fs_cli looks at ~/.fs_cli_conf first, then /etc/fs_cli.conf. Without one of
-# these, it tries the defaults (127.0.0.1:8021 / ClueCon) and fails after we
-# change the password. Write a system-wide config readable only by root.
+# --- 9. fs_cli.conf ----------------------------------------------------------
 echo ">>> Writing /etc/fs_cli.conf"
 cat >/etc/fs_cli.conf <<EOF
 [default]
@@ -340,8 +346,6 @@ EOF
 chmod 600 /etc/fs_cli.conf
 chown root:root /etc/fs_cli.conf
 
-# Also drop a per-user copy for the human who ran sudo, so they don't have to
-# `sudo fs_cli`. Only readable by them.
 if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
   USER_HOME="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
   if [[ -n "$USER_HOME" && -d "$USER_HOME" ]]; then
@@ -351,7 +355,6 @@ if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
   fi
 fi
 
-# Sanity check: can fs_cli connect with the new password?
 if [[ -n "$FS_CLI" ]] && systemctl is-active --quiet freeswitch; then
   if "$FS_CLI" -x 'status' >/dev/null 2>&1; then
     echo ">>> fs_cli connects OK with the new password."
@@ -361,17 +364,21 @@ if [[ -n "$FS_CLI" ]] && systemctl is-active --quiet freeswitch; then
   fi
 fi
 
-# --- 10. verify the fail2ban filter is actually matching ---------------------
-# Print a one-line summary so the operator can see whether the regex is
-# catching anything in their existing log. If matched=0 here on a box with
-# any meaningful log history, something is wrong — usually a log path
-# mismatch or the FreeSWITCH log format has drifted from what the regex
-# expects. Catching this here is the difference between knowing your
-# protection works and walking away thinking it does.
+# --- 10. verify the fail2ban filters are matching ----------------------------
+# Print a one-line summary per filter so the operator can see whether each
+# regex is catching anything in their existing log. If matched=0 here on a
+# box with any meaningful log history, something is wrong — usually a log
+# path mismatch or the FreeSWITCH log format has drifted from what the
+# regex expects.
 if [[ "$SKIP_FAIL2BAN" != "1" ]] && [[ -f "$FS_LOG" ]] && [[ -s "$FS_LOG" ]]; then
   echo
-  echo ">>> fail2ban-regex result against ${FS_LOG}:"
+  echo ">>> fail2ban-regex: strict filter against ${FS_LOG}:"
   fail2ban-regex --print-no-missed "$FS_LOG" /etc/fail2ban/filter.d/freeswitch.conf 2>/dev/null \
+    | grep -E "^Lines:|^Failregex: " \
+    | head -5 || true
+  echo
+  echo ">>> fail2ban-regex: aggressive filter against ${FS_LOG}:"
+  fail2ban-regex --print-no-missed "$FS_LOG" /etc/fail2ban/filter.d/freeswitch-aggressive.conf 2>/dev/null \
     | grep -E "^Lines:|^Failregex: " \
     | head -5 || true
   echo
@@ -390,14 +397,20 @@ $( [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]] && echo " User fs_cli:   
  Original XML files: <file>.bak alongside each modified file
 ================================================================
 
-Active fail2ban jails:
-  - freeswitch  (3 fails / 10 min -> 24h ban on SIP ports)
-  - sshd        (default thresholds, journald backend)
-  - recidive    (3 cross-jail bans / 24h -> 7d ban on ALL ports)
+Active fail2ban jails (three-layer SIP defense):
+  - sshd                   SSH brute-force, default thresholds
+  - freeswitch             3 auth failures / 10 min -> 24h ban
+                           (catches credential brute-force)
+  - freeswitch-aggressive  20 auth events / 5 min -> 24h ban
+                           (catches unauthenticated INVITE floods —
+                           the dominant modern attack pattern)
+  - recidive               3 cross-jail bans / 24h -> 7d ALL-PORT ban
+                           (escalates persistent repeat offenders)
 
 Useful checks:
   fail2ban-client status
   fail2ban-client status freeswitch
+  fail2ban-client status freeswitch-aggressive
   fail2ban-client status recidive
   cat ${CREDS_FILE}
 
