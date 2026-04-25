@@ -11,26 +11,47 @@
 #      actually reach the log (default is OFF — this is why fail2ban setups
 #      for FreeSWITCH silently fail to catch anything out of the box)
 #   5. Writes generated credentials to /root/freeswitch-credentials.txt
-#   6. Installs and configures fail2ban with a THREE-LAYER defense:
-#        - Strict 'freeswitch' jail (3 auth failures in 10 min -> 24h ban)
-#          catches old-school credential brute-force attacks
-#        - Loose 'freeswitch-aggressive' jail (20 events in 5 min -> 24h ban)
-#          catches the modern attack pattern: unauthenticated INVITE floods
-#          that never even attempt to authenticate, so they never generate
-#          'SIP auth failure' lines and slip past the strict jail entirely
-#        - 'recidive' jail (3 cross-jail bans in 24h -> 7d all-port ban)
-#          escalates IPs that get banned repeatedly by either of the above
-#        - rsyslog + python3-systemd so the sshd jail works on minimal Debian
+#   6. Installs and configures fail2ban with a TWO-LAYER defense:
+#        - 'freeswitch' jail (20 SIP auth events / 5 min -> 24h ban,
+#          all-ports drop) catches the dominant modern attack pattern:
+#          unauthenticated INVITE floods that never even attempt to
+#          authenticate. The filter matches both 'auth failure' AND
+#          'auth challenge', which by itself would false-positive on
+#          legitimate users — but real softphones generate only 1-3
+#          challenges per registration cycle, while scanners generate
+#          20+ in seconds.
+#        - 'recidive' jail (3 cross-jail bans / 24h -> 7d all-port ban)
+#          escalates repeat offenders that wait out the 24h bantime.
+#        - rsyslog + python3-systemd so the sshd jail works on minimal
+#          Debian.
 #   7. Configures ufw: default deny, allow SSH + RTP, allow SIP
 #      (optionally restricted to specific source IPs)
-#   8. Reloads FreeSWITCH using the PREVIOUS ESL password so the reload itself
-#      actually authenticates; rescans sofia profiles to apply #4
-#   9. Writes /etc/fs_cli.conf and ~SUDO_USER/.fs_cli_conf with the new ESL
-#      password so `fs_cli` keeps working after the rotation
+#   8. Reloads FreeSWITCH using the PREVIOUS ESL password so the reload
+#      itself authenticates; rescans sofia profiles to apply #4
+#   9. Writes /etc/fs_cli.conf and ~SUDO_USER/.fs_cli_conf with the new
+#      ESL password so `fs_cli` keeps working after the rotation
 #  10. Runs fail2ban-regex against the live FreeSWITCH log to print a
-#      one-line summary of whether each filter is actually matching anything.
-#      If you see "matched: 0" here, something is wrong — fix it before
-#      walking away.
+#      one-line summary of whether the filter is actually matching.
+#  11. Verifies bans are actually being enforced — places a test ban on
+#      an RFC5737 documentation IP, checks that an iptables rule
+#      appeared, then unbans. This catches the "fail2ban running, bans
+#      logged, but no iptables rule actually present" failure mode.
+#
+# Lessons baked into v4:
+#   - Debian 12 minimal images don't install iptables (they use nftables
+#     for the kernel firewall, but no userspace iptables tool). Without
+#     iptables, fail2ban's banactions silently fail and bans are theater.
+#     v4 always installs iptables, even with SKIP_FIREWALL=1.
+#   - fail2ban's default banaction is iptables-multiport (TCP only). For
+#     SIP-on-UDP, this means the actionstart wires up TCP-only rules and
+#     UDP scanner traffic walks right through. v4 sets banaction =
+#     iptables-allports explicitly on the freeswitch jail.
+#   - fail2ban's `reload` command does not reliably swap banactions when
+#     the jail config changes. v4 always does stop -> flush iptables ->
+#     start to guarantee a clean state, even on re-runs.
+#   - Two overlapping freeswitch jails (strict + aggressive) cause chain
+#     allocation conflicts in fail2ban's actionstart. v4 ships one jail
+#     whose filter matches both attack patterns.
 #
 # What it does NOT do (leaves to you):
 #   - Disable individual modules (too risky to guess what you use)
@@ -50,13 +71,12 @@ SKIP_FIREWALL="${SKIP_FIREWALL:-0}"
 SKIP_FAIL2BAN="${SKIP_FAIL2BAN:-0}"
 CREDS_FILE="/root/freeswitch-credentials.txt"
 
-# --- preflight ---------------------------------------------------------------
+# --- preflight 1: privileges and FreeSWITCH layout ---------------------------
 if [[ $EUID -ne 0 ]]; then
   echo "Run as root (sudo)." >&2
   exit 1
 fi
 
-# Detect FreeSWITCH config dir (package vs source install)
 if [[ -d /etc/freeswitch ]]; then
   FS_CONF="/etc/freeswitch"
 elif [[ -d /usr/local/freeswitch/etc/freeswitch ]]; then
@@ -68,7 +88,6 @@ else
 fi
 echo ">>> FreeSWITCH config dir: ${FS_CONF}"
 
-# Locate fs_cli (for reload)
 if command -v fs_cli >/dev/null; then
   FS_CLI="$(command -v fs_cli)"
 elif [[ -x /usr/local/freeswitch/bin/fs_cli ]]; then
@@ -84,6 +103,48 @@ ESL_XML="${FS_CONF}/autoload_configs/event_socket.conf.xml"
 for f in "$VARS_XML" "$ESL_XML"; do
   [[ -f "$f" ]] || { echo "Missing required file: $f" >&2; exit 1; }
 done
+
+# --- preflight 2: runtime tools ----------------------------------------------
+# Check for tools the script needs at various points, but especially the
+# tools fail2ban needs to enforce bans. On Debian 12 minimal cloud images,
+# iptables is NOT installed by default — the system uses nftables. fail2ban
+# defaults to iptables-based banactions, so a missing iptables means bans
+# will be logged but never enforced. We saw this in practice: 4.4M SIP
+# auth events, fail2ban running, "Total banned: 9" in the status — and
+# zero IPs actually dropped at the kernel level.
+#
+# We always install iptables here, even when SKIP_FIREWALL=1, because
+# SKIP_FIREWALL means "don't manage firewall policy" not "don't enforce
+# fail2ban bans." Those are different concerns.
+
+echo ">>> Checking runtime dependencies"
+NEEDS_INSTALL=()
+
+# iptables: required by fail2ban banactions. Debian 12 doesn't install it
+# by default. Check both PATH and /usr/sbin (which sudo includes but a
+# user's PATH may not).
+if ! command -v iptables >/dev/null 2>&1 && [[ ! -x /usr/sbin/iptables ]]; then
+  echo ">>> iptables not found — fail2ban needs it to enforce bans"
+  NEEDS_INSTALL+=(iptables)
+fi
+
+# openssl: used to generate passwords. Almost always present, but cheap
+# to verify on a truly minimal install.
+if ! command -v openssl >/dev/null 2>&1; then
+  NEEDS_INSTALL+=(openssl)
+fi
+
+# tar: used for the config backup. Same reasoning.
+if ! command -v tar >/dev/null 2>&1; then
+  NEEDS_INSTALL+=(tar)
+fi
+
+if [[ ${#NEEDS_INSTALL[@]} -gt 0 ]]; then
+  echo ">>> Installing missing dependencies: ${NEEDS_INSTALL[*]}"
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y --no-install-recommends "${NEEDS_INSTALL[@]}"
+fi
 
 # --- 1. backup ---------------------------------------------------------------
 BACKUP="/root/freeswitch-config-backup-$(date +%Y%m%d-%H%M%S).tgz"
@@ -157,6 +218,17 @@ if [[ "$SKIP_FAIL2BAN" != "1" ]]; then
   apt-get update -qq
   apt-get install -y --no-install-recommends fail2ban rsyslog python3-systemd
 
+  # Stop fail2ban and flush iptables BEFORE writing new config. This handles
+  # two cases: fresh install (no-op, fail2ban isn't running yet) and re-runs
+  # (clears any stale chains and accumulated banactions from previous
+  # configurations). fail2ban's `reload` does not reliably swap banactions
+  # when jail configs change — full stop + flush + start is the only safe
+  # path.
+  systemctl stop fail2ban 2>/dev/null || true
+  iptables -F 2>/dev/null || true
+  iptables -X 2>/dev/null || true
+
+  # Determine the FreeSWITCH log path based on install layout.
   if [[ "$FS_CONF" == "/etc/freeswitch" ]]; then
     FS_LOG="/var/log/freeswitch/freeswitch.log"
   else
@@ -173,92 +245,66 @@ if [[ "$SKIP_FAIL2BAN" != "1" ]]; then
     fi
   fi
 
-  # ---- STRICT FILTER ------------------------------------------------------
-  # The fail2ban package ships /etc/fail2ban/filter.d/freeswitch.conf but its
-  # regex doesn't match FreeSWITCH 1.10.x output (which includes a CPU-usage
-  # percentage between the timestamp and [WARNING]). Overwrite it directly
-  # rather than using a .local with `before =`, which causes a recursive
-  # include loop that crashes fail2ban with "maximum recursion depth exceeded".
+  # ---- FREESWITCH FILTER --------------------------------------------------
+  # The fail2ban package ships /etc/fail2ban/filter.d/freeswitch.conf but
+  # its regex doesn't match FreeSWITCH 1.10.x output (which includes a
+  # CPU-usage percentage between the timestamp and [WARNING]). Overwrite
+  # it directly rather than using a .local with `before =`, which causes
+  # a recursive include loop that crashes fail2ban with "maximum recursion
+  # depth exceeded".
   #
-  # This filter matches `SIP auth failure` and `Can't find user` ONLY.
-  # It does NOT match `SIP auth challenge` because every legitimate SIP
-  # transaction begins with a server-issued challenge — banning on a single
-  # challenge would ban every real user the moment they registered.
+  # This filter matches BOTH 'SIP auth failure' AND 'SIP auth challenge'.
+  # The strict version of this filter (failures only) misses the dominant
+  # modern attack pattern: scanners blasting unauthenticated INVITEs, never
+  # responding to the challenge, and rotating to the next source port.
+  # Those probes only generate 'challenge' lines — never 'failure' — so
+  # the strict filter sees nothing and bans no one despite millions of
+  # log entries.
+  #
+  # Matching 'challenge' would false-positive on legitimate users at low
+  # thresholds (every real INVITE generates a challenge), but the jail
+  # threshold below (20 in 5 min) is well above what any softphone
+  # produces during normal use.
   cat >/etc/fail2ban/filter.d/freeswitch.conf <<'EOF'
-[Definition]
-failregex = ^.*\[WARNING\]\s+sofia_reg\.c:\d+\s+SIP auth failure \((?:REGISTER|INVITE)\) on sofia profile \S+ for \[[^\]]*\] from ip <HOST>\s*$
-            ^.*\[WARNING\]\s+sofia_reg\.c:\d+\s+Can't find user \[[^\]]*\] from <HOST>\s*$
-ignoreregex =
-EOF
-  rm -f /etc/fail2ban/filter.d/freeswitch.local
-
-  # ---- AGGRESSIVE FILTER --------------------------------------------------
-  # The strict filter above catches credential brute-force, but misses a far
-  # more common attack pattern: a scanner blasting unauthenticated INVITEs
-  # at the box, getting challenged, never responding, and immediately firing
-  # the next probe from a different source port. That pattern generates only
-  # 'SIP auth challenge' lines — never 'failure' — so the strict filter sees
-  # nothing.
-  #
-  # This filter ALSO matches 'challenge' events. By itself that would ban
-  # legitimate users on first call. Paired with maxretry=20 in the jail
-  # below, it doesn't — a real softphone generates only 1-3 challenges per
-  # registration cycle. A scanner generates 20 in seconds.
-  cat >/etc/fail2ban/filter.d/freeswitch-aggressive.conf <<'EOF'
 [Definition]
 failregex = ^.*\[WARNING\]\s+sofia_reg\.c:\d+\s+SIP auth (?:failure|challenge) \((?:REGISTER|INVITE)\) on sofia profile \S+ for \[[^\]]*\] from ip <HOST>\s*$
             ^.*\[WARNING\]\s+sofia_reg\.c:\d+\s+Can't find user \[[^\]]*\] from <HOST>\s*$
 ignoreregex =
 EOF
+  rm -f /etc/fail2ban/filter.d/freeswitch.local
 
-  # ---- STRICT JAIL --------------------------------------------------------
-  # Tighter thresholds than fail2ban defaults. Three real auth failures in
-  # 10 minutes earns a 24h ban. Real users almost never trigger this; the
-  # only false-positive scenario is someone fumbling a password 3+ times,
-  # which is recoverable with `fail2ban-client unban <ip>`.
+  # ---- FREESWITCH JAIL ----------------------------------------------------
+  # banaction = iptables-allports is critical. fail2ban's default banaction
+  # is iptables-multiport, which only blocks TCP. SIP scanner traffic on
+  # 5060/UDP would walk right through a TCP-only ban rule. We need the
+  # all-ports, all-protocols ban to actually drop the packets.
+  #
+  # 20 events in 5 minutes is well below any real scanner's volume (often
+  # 5+ INVITEs per second from a single IP) and well above what a
+  # legitimate softphone produces (1-3 challenges per registration cycle,
+  # cycles of an hour or more apart).
   cat >/etc/fail2ban/jail.d/freeswitch.local <<EOF
 [freeswitch]
-enabled  = true
-filter   = freeswitch
-port     = 5060,5061,5080,5081
-protocol = all
-logpath  = ${FS_LOG}
-maxretry = 3
-findtime = 600
-bantime  = 86400
-EOF
-
-  # ---- AGGRESSIVE JAIL ----------------------------------------------------
-  # Catches unauthenticated INVITE floods. 20 events in 5 minutes is well
-  # below typical scanner volume (often 5+ per second from a single IP) and
-  # well above what any real softphone would generate during normal use.
-  #
-  # If your environment has unusually chatty SIP clients (PBXs that
-  # re-register aggressively, monitoring systems that probe SIP, etc.),
-  # raise maxretry to 40 or 50. Watch the jail's match count for a few hours
-  # after install — if your own IPs show up, the threshold is too low.
-  cat >/etc/fail2ban/jail.d/freeswitch-aggressive.local <<EOF
-[freeswitch-aggressive]
-enabled  = true
-filter   = freeswitch-aggressive
-port     = 5060,5061,5080,5081
-protocol = all
-logpath  = ${FS_LOG}
-maxretry = 20
-findtime = 300
-bantime  = 86400
+enabled   = true
+filter    = freeswitch
+port      = 5060,5061,5080,5081
+protocol  = all
+logpath   = ${FS_LOG}
+banaction = iptables-allports
+maxretry  = 20
+findtime  = 300
+bantime   = 86400
 EOF
 
   # ---- RECIDIVE JAIL ------------------------------------------------------
-  # The recidive jail watches fail2ban's own log. If an IP gets banned 3
-  # times within 24 hours (across ANY jail — sshd, freeswitch, the
-  # aggressive jail, etc.) it gets banned for a week across all ports
-  # via banaction_allports.
+  # Watches fail2ban's own log. If an IP gets banned 3 times within 24
+  # hours (across ANY jail — sshd, freeswitch, etc.) it gets banned for a
+  # week across all ports via banaction_allports.
   #
-  # This catches the persistent scanners that wait out a 24h bantime and
-  # immediately come back. Without recidive, the same handful of IPs cycle
-  # ban -> wait -> ban -> wait indefinitely. With it, a few cycles is all
-  # they get before they're locked out for a week across every port.
+  # This catches persistent scanners that wait out the 24h bantime and
+  # come back. Without recidive, the same handful of IPs cycle ban ->
+  # wait -> ban -> wait indefinitely. With it, a few cycles is all they
+  # get before they're locked out for a week across every port.
   #
   # No false-positive risk: recidive only escalates IPs that fail2ban has
   # ALREADY banned multiple times.
@@ -273,16 +319,19 @@ maxretry  = 3
 EOF
 
   # ---- SSHD ---------------------------------------------------------------
-  # Default sshd jail on minimal Debian reads /var/log/auth.log which doesn't
-  # exist without rsyslog. Pin it to the systemd backend, which reads auth
-  # events directly from journald and works regardless of rsyslog state.
+  # Default sshd jail on minimal Debian reads /var/log/auth.log which
+  # doesn't exist without rsyslog. Pin it to the systemd backend, which
+  # reads auth events directly from journald and works regardless of
+  # rsyslog state.
   cat >/etc/fail2ban/jail.d/sshd.local <<EOF
 [sshd]
 backend = systemd
 EOF
 
   systemctl enable --now fail2ban
-  systemctl restart fail2ban
+  # Brief sleep to let actionstart wire up the chains before subsequent steps
+  # try to use fail2ban-client (notably the verification step at the end).
+  sleep 3
 fi
 
 # --- 7. firewall (ufw) -------------------------------------------------------
@@ -364,23 +413,56 @@ if [[ -n "$FS_CLI" ]] && systemctl is-active --quiet freeswitch; then
   fi
 fi
 
-# --- 10. verify the fail2ban filters are matching ----------------------------
-# Print a one-line summary per filter so the operator can see whether each
-# regex is catching anything in their existing log. If matched=0 here on a
-# box with any meaningful log history, something is wrong — usually a log
-# path mismatch or the FreeSWITCH log format has drifted from what the
-# regex expects.
+# --- 10. verify the fail2ban filter is matching ------------------------------
+# Print a one-line summary so the operator can see whether the regex is
+# catching anything in their existing log. If matched=0 here on a box with
+# any meaningful log history, something is wrong — usually a log path
+# mismatch or the FreeSWITCH log format has drifted from what the regex
+# expects.
 if [[ "$SKIP_FAIL2BAN" != "1" ]] && [[ -f "$FS_LOG" ]] && [[ -s "$FS_LOG" ]]; then
   echo
-  echo ">>> fail2ban-regex: strict filter against ${FS_LOG}:"
+  echo ">>> fail2ban-regex result against ${FS_LOG}:"
   fail2ban-regex --print-no-missed "$FS_LOG" /etc/fail2ban/filter.d/freeswitch.conf 2>/dev/null \
     | grep -E "^Lines:|^Failregex: " \
     | head -5 || true
   echo
-  echo ">>> fail2ban-regex: aggressive filter against ${FS_LOG}:"
-  fail2ban-regex --print-no-missed "$FS_LOG" /etc/fail2ban/filter.d/freeswitch-aggressive.conf 2>/dev/null \
-    | grep -E "^Lines:|^Failregex: " \
-    | head -5 || true
+fi
+
+# --- 11. verify fail2ban bans are actually being enforced --------------------
+# This is the most important diagnostic in the script. It catches the
+# "fail2ban looks healthy but isn't enforcing anything" failure mode
+# that's invisible at the daemon level.
+#
+# We saw this in practice: 4.4M auth events in the FreeSWITCH log,
+# fail2ban running, "Total banned: 9" in fail2ban-client status — and
+# zero of those bans translated into iptables rules. Causes can include:
+#   - iptables not installed (Debian 12 minimal default)
+#   - banaction set to a TCP-only action while attacks come over UDP
+#   - stale chains from a prior run preventing actionstart
+#   - any future failure mode we haven't seen yet
+#
+# The check: ban an RFC5737 documentation IP, look for it in iptables,
+# unban. If we see the rule, enforcement works. If not, something is
+# wrong and the operator needs to know NOW, not when their box gets
+# pwned.
+if [[ "$SKIP_FAIL2BAN" != "1" ]]; then
+  echo ">>> Verifying fail2ban ban enforcement..."
+  TEST_IP="192.0.2.99"   # RFC5737, reserved for documentation, never legitimate
+
+  fail2ban-client set freeswitch banip "$TEST_IP" >/dev/null 2>&1 || true
+  sleep 2
+
+  if iptables -L -n 2>/dev/null | grep -q "$TEST_IP"; then
+    echo ">>> Confirmed: bans are enforced at the iptables level."
+    fail2ban-client set freeswitch unbanip "$TEST_IP" >/dev/null 2>&1 || true
+  else
+    echo "!!! WARNING: fail2ban placed a ban for $TEST_IP but no iptables rule appeared."
+    echo "!!! Bans are being LOGGED but NOT ENFORCED."
+    echo "!!! Check:"
+    echo "!!!   sudo iptables -L -n | grep f2b"
+    echo "!!!   sudo tail -50 /var/log/fail2ban.log"
+    echo "!!!   sudo fail2ban-client status freeswitch"
+  fi
   echo
 fi
 
@@ -397,21 +479,20 @@ $( [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]] && echo " User fs_cli:   
  Original XML files: <file>.bak alongside each modified file
 ================================================================
 
-Active fail2ban jails (three-layer SIP defense):
-  - sshd                   SSH brute-force, default thresholds
-  - freeswitch             3 auth failures / 10 min -> 24h ban
-                           (catches credential brute-force)
-  - freeswitch-aggressive  20 auth events / 5 min -> 24h ban
-                           (catches unauthenticated INVITE floods —
-                           the dominant modern attack pattern)
-  - recidive               3 cross-jail bans / 24h -> 7d ALL-PORT ban
-                           (escalates persistent repeat offenders)
+Active fail2ban jails (two-layer SIP defense + sshd):
+  - sshd        SSH brute-force, default thresholds, journald backend
+  - freeswitch  20 SIP auth events / 5 min -> 24h all-ports ban
+                (catches unauthenticated INVITE floods AND credential
+                brute-force in a single jail)
+  - recidive    3 cross-jail bans / 24h -> 7d ALL-PORT ban
+                (escalates persistent repeat offenders)
 
 Useful checks:
   fail2ban-client status
   fail2ban-client status freeswitch
-  fail2ban-client status freeswitch-aggressive
   fail2ban-client status recidive
+  iptables -L INPUT -n | grep f2b      # confirm jails wired into INPUT
+  iptables -L -n | grep "Chain f2b"     # all should show (1 references)
   cat ${CREDS_FILE}
 
 Still recommended (manual):
