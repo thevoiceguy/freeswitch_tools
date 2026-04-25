@@ -11,14 +11,25 @@
 #      actually reach the log (default is OFF — this is why fail2ban setups
 #      for FreeSWITCH silently fail to catch anything out of the box)
 #   5. Writes generated credentials to /root/freeswitch-credentials.txt
-#   6. Installs and configures fail2ban with a working FreeSWITCH 1.10.x filter,
-#      plus rsyslog + python3-systemd so the sshd jail works on minimal Debian
+#   6. Installs and configures fail2ban with:
+#        - A working FreeSWITCH 1.10.x filter (default doesn't match because
+#          1.10.x logs include a CPU-usage % between timestamp and [WARNING])
+#        - Tighter thresholds than the defaults (3 failures in 10 min -> 24h
+#          ban) because SIP scanners burn through default thresholds easily
+#        - A recidive jail that escalates repeat offenders to a 1-week
+#          all-port ban (most bad actors come back the moment their first
+#          ban expires; recidive watches fail2ban's own log to catch them)
+#        - rsyslog + python3-systemd so the sshd jail works on minimal Debian
 #   7. Configures ufw: default deny, allow SSH + RTP, allow SIP
 #      (optionally restricted to specific source IPs)
 #   8. Reloads FreeSWITCH using the PREVIOUS ESL password so the reload itself
 #      actually authenticates; rescans sofia profiles to apply #4
 #   9. Writes /etc/fs_cli.conf and ~SUDO_USER/.fs_cli_conf with the new ESL
 #      password so `fs_cli` keeps working after the rotation
+#  10. Runs fail2ban-regex against the live FreeSWITCH log to print a
+#      one-line summary of whether the filter is actually matching anything.
+#      If you see "matched: 0" here, something is wrong — fix it before
+#      walking away.
 #
 # What it does NOT do (leaves to you):
 #   - Disable individual modules (too risky to guess what you use)
@@ -190,6 +201,11 @@ if [[ "$SKIP_FAIL2BAN" != "1" ]]; then
   # percentage between the timestamp and [WARNING]). Overwrite it directly
   # rather than using a .local with `before =`, which causes a recursive
   # include loop that crashes fail2ban with "maximum recursion depth exceeded".
+  #
+  # We deliberately match `SIP auth failure` and `Can't find user` only.
+  # We do NOT match `SIP auth challenge` because every legitimate SIP
+  # request starts with a challenge — banning on challenge would ban every
+  # real user the moment they registered.
   cat >/etc/fail2ban/filter.d/freeswitch.conf <<'EOF'
 [Definition]
 failregex = ^.*\[WARNING\]\s+sofia_reg\.c:\d+\s+SIP auth failure \((?:REGISTER|INVITE)\) on sofia profile \S+ for \[[^\]]*\] from ip <HOST>\s*$
@@ -199,6 +215,11 @@ EOF
   # Remove any stale .local override from previous buggy runs
   rm -f /etc/fail2ban/filter.d/freeswitch.local
 
+  # Tighter thresholds than fail2ban defaults. Real users almost never hit
+  # 3 SIP auth failures in 10 minutes; SIP scanners hit hundreds. The 24h
+  # bantime means a scanner has to burn a fresh IP per test — the only
+  # downside is that a legitimate user who triple-fumbles their password
+  # gets locked out for 24h until you `fail2ban-client unban <ip>` them.
   cat >/etc/fail2ban/jail.d/freeswitch.local <<EOF
 [freeswitch]
 enabled  = true
@@ -206,9 +227,30 @@ filter   = freeswitch
 port     = 5060,5061,5080,5081
 protocol = all
 logpath  = ${FS_LOG}
-maxretry = 5
+maxretry = 3
 findtime = 600
-bantime  = 3600
+bantime  = 86400
+EOF
+
+  # The recidive jail watches fail2ban's own log. If an IP gets banned 3
+  # times within 24 hours (across ANY jail — sshd, freeswitch, etc.) it
+  # gets banned for a week across all ports via banaction_allports.
+  #
+  # This is what catches the persistent SIP scanners that wait out a 24h
+  # bantime and immediately come back. Without recidive, the same handful
+  # of IPs cycle ban -> wait -> ban -> wait indefinitely. With it, a few
+  # cycles is all they get before they're locked out for a week.
+  #
+  # No false-positive risk: recidive only escalates IPs that fail2ban
+  # ALREADY banned multiple times.
+  cat >/etc/fail2ban/jail.d/recidive.local <<EOF
+[recidive]
+enabled   = true
+logpath   = /var/log/fail2ban.log
+banaction = %(banaction_allports)s
+bantime   = 604800
+findtime  = 86400
+maxretry  = 3
 EOF
 
   # Default sshd jail on minimal Debian reads /var/log/auth.log which doesn't
@@ -319,6 +361,22 @@ if [[ -n "$FS_CLI" ]] && systemctl is-active --quiet freeswitch; then
   fi
 fi
 
+# --- 10. verify the fail2ban filter is actually matching ---------------------
+# Print a one-line summary so the operator can see whether the regex is
+# catching anything in their existing log. If matched=0 here on a box with
+# any meaningful log history, something is wrong — usually a log path
+# mismatch or the FreeSWITCH log format has drifted from what the regex
+# expects. Catching this here is the difference between knowing your
+# protection works and walking away thinking it does.
+if [[ "$SKIP_FAIL2BAN" != "1" ]] && [[ -f "$FS_LOG" ]] && [[ -s "$FS_LOG" ]]; then
+  echo
+  echo ">>> fail2ban-regex result against ${FS_LOG}:"
+  fail2ban-regex --print-no-missed "$FS_LOG" /etc/fail2ban/filter.d/freeswitch.conf 2>/dev/null \
+    | grep -E "^Lines:|^Failregex: " \
+    | head -5 || true
+  echo
+fi
+
 # --- summary -----------------------------------------------------------------
 cat <<EOF
 
@@ -331,6 +389,17 @@ $( [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]] && echo " User fs_cli:   
  Config backup:      ${BACKUP}
  Original XML files: <file>.bak alongside each modified file
 ================================================================
+
+Active fail2ban jails:
+  - freeswitch  (3 fails / 10 min -> 24h ban on SIP ports)
+  - sshd        (default thresholds, journald backend)
+  - recidive    (3 cross-jail bans / 24h -> 7d ban on ALL ports)
+
+Useful checks:
+  fail2ban-client status
+  fail2ban-client status freeswitch
+  fail2ban-client status recidive
+  cat ${CREDS_FILE}
 
 Still recommended (manual):
   - Set per-extension passwords in ${FS_CONF}/directory/default/*.xml
